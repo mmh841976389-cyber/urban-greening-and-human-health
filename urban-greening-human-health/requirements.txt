@@ -1,0 +1,25 @@
+# Core data / geo
+pandas
+numpy
+geopandas
+shapely
+rasterio
+
+# Plotting
+matplotlib
+seaborn
+
+# Stats / ML
+scipy
+scikit-learn
+statsmodels
+
+# Interpretability
+shap
+
+# Spatial stats
+mapclassify
+mgwr        # Geographically Weighted Regression (gwr.py)
+
+# Note: qgis_road_distance_tif.py requires QGIS (qgis / qgis.PyQt),
+# which is bundled with the QGIS desktop application and is NOT pip-installable.

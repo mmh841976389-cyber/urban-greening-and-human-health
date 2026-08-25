@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import warnings
@@ -114,9 +115,12 @@ print(f"Correlation between corrected MAP deviation and age: {corr_after:.4f}")
 X = df[feature_cols].values
 y_corrected = df["map_deviation_corrected"].values
 
-rf = RandomForestRegressor(n_estimators=500, max_depth=100, random_state=42)
-rf.fit(X, y_corrected)
-y_pred_rf = rf.predict(X)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_corrected, test_size=0.2, random_state=42)
+
+rf = RandomForestRegressor(n_estimators=200, max_depth=80, random_state=42)
+rf.fit(X_train, y_train)
+y_pred_rf = rf.predict(X_test)
 
 print("\nModel performance:")
 print(f"MAE = {mean_absolute_error(y_corrected, y_pred_rf):.4f}")

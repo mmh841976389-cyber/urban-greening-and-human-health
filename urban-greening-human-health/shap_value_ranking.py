@@ -168,8 +168,8 @@ def main(data_path, target_var="血糖偏离度  ", save_plot=None):
 
         print("\n4. Training random forest and computing SHAP values...")
         rf = RandomForestRegressor(
-            n_estimators=500,
-            max_depth=100,
+            n_estimators=200,
+            max_depth=80,
             min_samples_split=5,
             min_samples_leaf=2,
             max_features="sqrt",

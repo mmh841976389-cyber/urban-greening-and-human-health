@@ -1,4 +1,5 @@
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import numpy as np
 import pandas as pd
@@ -51,14 +52,16 @@ X = df[feature_cols].to_numpy()
 
 
 # Train the model
-us_model = RandomForestRegressor(random_state=42, max_depth=100, n_estimators=500)
-us_model.fit(X, y)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+us_model = RandomForestRegressor(random_state=42, max_depth=80, n_estimators=200)
+us_model.fit(X_train, y_train)
 
 # Get predictions and evaluation metrics
-y_pred = us_model.predict(X)
-print("Training Mean Absolute Error:", mean_absolute_error(y, y_pred))
-print("Training Mean Squared Error:", mean_squared_error(y, y_pred))
-print("Training R^2 Score:", r2_score(y, y_pred))
+y_pred = us_model.predict(X_test)
+print("Test Mean Absolute Error:", mean_absolute_error(y_test, y_pred))
+print("Test Mean Squared Error:", mean_squared_error(y_test, y_pred))
+print("Test R^2 Score:", r2_score(y_test, y_pred))
 
 # Feature-importance analysis
 importance_scores = us_model.feature_importances_

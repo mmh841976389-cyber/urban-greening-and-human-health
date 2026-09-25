@@ -1,212 +1,117 @@
-import pandas as pd
+# -*- coding: utf-8 -*-
+"""
+TreeSHAP attribution for the random forest fitted under the control-factor protocol.
+
+The forest is trained on the residual of the outcome after regressing out the
+confounders, so the SHAP values describe the model's use of the greenness and
+environment features with confounding held fixed. For each outcome the four
+features with the largest Gini importance are exported for plotting.
+
+Outputs: shap_long.csv (outcome, feature, value, shap), shap_importance_rank.csv
+"""
+import time
+import warnings
+
 import numpy as np
+import pandas as pd
 import shap
-import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-import os
+from sklearn.linear_model import LinearRegression
 
-# ==================== Basic setup ====================
-try:
-    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
-    plt.rcParams["axes.unicode_minus"] = False
-    plt.rcParams["xtick.labelfontfamily"] = "Times New Roman"
-    plt.rcParams["ytick.labelfontfamily"] = "Times New Roman"
-except:
-    print("Warning: Chinese font setup failed")
+warnings.filterwarnings("ignore")
 
-# ==================== Original factor list (verify against your actual data column names) ====================
-ALL_FACTORS = [
-    "植被年龄",
-    "三年平均PM2.5",
-    "平均绿度",
-    "人口密度",
-    "地形高程",
-    "夜光指数",
-    "离道路距离",
-    "绿度季节变化",
-    "绿度聚集度",
-    "绿度范围"
+CSV = "data/factor_table.csv"
+OUT_LONG = "output/ml/shap_long.csv"
+OUT_RANK = "output/ml/shap_importance_rank.csv"
+
+RNG, N_EST, MAX_DEPTH, MIN_LEAF = 42, 300, 30, 10
+N_SHAP = 3000            # number of individuals sampled for the SHAP computation
+
+FEATURES = [
+    "绿度暴露_r500", "绿度强度_r500", "绿度聚集度_GAI", "季节振幅_谐波_r500", "绿度年龄_r500",
+    "PM2.5_r500", "人口密度_r500", "DEM_r500", "夜光_r500", "道路距离_主干道_r500",
 ]
 
-# ==================== Function definitions ====================
-def calculate_vif(X, threshold=10.0, keep_factors=None):
-    """Compute VIF and automatically remove highly collinear features."""
-    X_vif = X.copy()
-    keep_factors = keep_factors if keep_factors is not None else []
+# individual confounders used as control factors (cubic age added below)
+CONF = ["age", "gender", "bmi", "smoking", "drinking", "pa", "meal_reg"]
 
-    while True:
-        if "const" in X_vif.columns:
-            X_vif = X_vif.drop("const", axis=1)
+CONTINUOUS = ["sbp", "dbp", "map", "fpg"]
+BINARY = ["是否高血压", "是否高血糖"]
+OUTCOMES = CONTINUOUS + BINARY
 
-        factors_to_evaluate = [f for f in X_vif.columns if f not in keep_factors]
-        if not factors_to_evaluate:
-            break
-
-        vif_indices = [X_vif.columns.get_loc(f) for f in factors_to_evaluate]
-        vif = [variance_inflation_factor(X_vif.values, i) for i in vif_indices]
-        max_vif = np.max(vif) if vif else 0
-
-        if max_vif > threshold:
-            max_idx = np.argmax(vif)
-            feature_to_drop = factors_to_evaluate[max_idx]
-            print(f"Removing high-collinearity feature: {feature_to_drop} (VIF = {max_vif:.2f})")
-            X_vif = X_vif.drop(feature_to_drop, axis=1)
-        else:
-            break
-    return X_vif
+OUTCOME_EN = {"sbp": "SBP", "dbp": "DBP", "map": "MAP", "fpg": "FPG",
+              "是否高血压": "Hypertension", "是否高血糖": "Hyperglycaemia"}
 
 
-def preprocess_data(df):
-    """Encode non-numeric factors as numeric."""
-    df_processed = df.copy()
-    for col in df_processed.select_dtypes(include=["object"]).columns:
-        if col in ALL_FACTORS:
-            le = LabelEncoder()
-            df_processed[col] = le.fit_transform(df_processed[col].astype(str))
-            print(f"Encoding non-numeric factor: '{col}'")
-    return df_processed
+def apply_qc(df):
+    """Drop physiologically implausible values, then winsorise at 1/99."""
+    d = df.copy()
+    mask = np.ones(len(d), bool)
+    for c, (lo, hi) in {"sbp": (80, 250), "dbp": (40, 150),
+                        "map": (50, 180), "fpg": (3, 15)}.items():
+        v = pd.to_numeric(d[c], errors="coerce")
+        mask &= (v >= lo) & (v <= hi)
+    d = d[mask].copy()
+    for c in CONTINUOUS:
+        v = pd.to_numeric(d[c], errors="coerce")
+        lo, hi = np.nanpercentile(v, [1, 99])
+        d[c] = v.clip(lo, hi)
+    return d.reset_index(drop=True)
 
 
-def get_shap_ranking(shap_values, X_test):
-    """Compute mean absolute SHAP value and sort in descending order."""
-    shap_matrix = shap_values[0] if isinstance(shap_values, list) else shap_values
-
-    present_factors = [f for f in ALL_FACTORS if f in X_test.columns]
-    if len(present_factors) != len(ALL_FACTORS):
-        missing = set(ALL_FACTORS) - set(present_factors)
-        raise ValueError(f"Missing original factors in data: {missing}")
-
-    factor_idx = [X_test.columns.get_loc(f) for f in present_factors]
-    shap_mean_abs = np.mean(np.abs(shap_matrix[:, factor_idx]), axis=0)
-
-    ranking_df = (
-        pd.DataFrame({"original_factor": present_factors, "mean(|SHAP|)": shap_mean_abs})
-        .sort_values(by="mean(|SHAP|)", ascending=False)
-        .reset_index(drop=True)
-    )
-    ranking_df["importance_rank"] = range(1, len(ranking_df) + 1)
-    return ranking_df
+def conf_matrix(d):
+    Xc = d[CONF].astype(float).copy()
+    Xc["age2"] = Xc["age"] ** 2
+    Xc["age3"] = Xc["age"] ** 3
+    return Xc.fillna(Xc.median()).values
 
 
-def plot_shap_ranking(ranking_df, save_path=None):
-    """Plot the SHAP factor-importance ranking bar chart."""
-    ranking_sorted = ranking_df.sort_values(by="mean(|SHAP|)", ascending=False).reset_index(drop=True)
-
-    plt.figure(figsize=(12, 10))
-    ax = plt.gca()
-
-    y_pos = np.arange(len(ranking_sorted))
-    bars = ax.barh(
-        y_pos,
-        ranking_sorted["mean(|SHAP|)"],
-        color="#2E86AB",
-        alpha=0.8,
-        edgecolor="#1A5F7A",
-    )
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(ranking_sorted["original_factor"], fontsize=12)
-    ax.invert_yaxis()
-
-    ax.set_xlabel("mean(|SHAP|) value", fontsize=14, fontweight="bold")
-    ax.set_title(
-        f"SHAP importance ranking of {len(ranking_sorted)} original factors (top rank at the top)",
-        fontsize=16,
-        fontweight="bold",
-        pad=20,
-    )
-
-    for bar, value, rank in zip(bars, ranking_sorted["mean(|SHAP|)"], ranking_sorted["importance_rank"]):
-        ax.text(
-            bar.get_width() + 0.0005,
-            bar.get_y() + bar.get_height() / 2,
-            f"Rank {rank} | {value:.4f}",
-            va="center",
-            ha="left",
-            fontsize=10,
-            fontfamily="Times New Roman",
-        )
-
-    ax.grid(axis="x", alpha=0.3, linestyle="--")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Chart saved to: {save_path}")
-    plt.show()
+def feature_matrix(d):
+    return d[FEATURES].astype(float).fillna(d[FEATURES].median()).values
 
 
-def main(data_path, target_var="血糖偏离度  ", save_plot=None):
-    try:
-        print("1. Reading data...")
-        data = pd.read_csv(data_path)
-        data_clean = data.replace([np.inf, -np.inf], np.nan).dropna()
-        print(f"Data after cleaning: {len(data_clean)} rows")
+def main():
+    df = pd.read_csv(CSV)
+    d = apply_qc(df)
+    print(f"analysis n = {len(d)}", flush=True)
 
-        if target_var not in data_clean.columns:
-            raise ValueError(f"Target variable not found: {target_var}")
-        missing_factors = [f for f in ALL_FACTORS if f not in data_clean.columns]
-        if missing_factors:
-            raise ValueError(f"Missing original factors in data: {missing_factors}")
+    Xf_all = feature_matrix(d)
+    Xc_all = conf_matrix(d)
+    rows, rank = [], []
+    t0 = time.time()
 
-        print("\n2. Preprocessing data...")
-        data_core = data_clean[ALL_FACTORS + [target_var]].copy()
-        data_processed = preprocess_data(data_core)
+    for oc in OUTCOMES:
+        y = pd.to_numeric(d[oc], errors="coerce").values.astype(float)
+        keep = ~np.isnan(y)
+        Xf, Xc, yy = Xf_all[keep], Xc_all[keep], y[keep]
 
-        print("\n3. Handling collinearity and splitting dataset...")
-        X = data_processed.drop(columns=[target_var])
-        y = data_processed[target_var]
-        X_vif = calculate_vif(X, keep_factors=ALL_FACTORS)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_vif, y, test_size=0.2, random_state=42
-        )
+        lr = LinearRegression().fit(Xc, yy)
+        resid = yy - lr.predict(Xc)
+        rf = RandomForestRegressor(n_estimators=N_EST, max_depth=MAX_DEPTH,
+                                   min_samples_leaf=MIN_LEAF, max_features=1.0,
+                                   random_state=RNG, n_jobs=-1).fit(Xf, resid)
 
-        print("\n4. Training random forest and computing SHAP values...")
-        rf = RandomForestRegressor(
-            n_estimators=200,
-            max_depth=80,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=42,
-            n_jobs=-1,
-        )
-        rf.fit(X_train, y_train)
-        explainer = shap.TreeExplainer(rf)
-        shap_vals = explainer.shap_values(X_test)
+        imp = rf.feature_importances_
+        order = np.argsort(imp)[::-1]
+        top4 = [int(j) for j in order[:4]]
+        for r_, j in enumerate(order):
+            rank.append(dict(outcome=OUTCOME_EN[oc], feature=FEATURES[int(j)],
+                             importance=round(float(imp[int(j)]), 5), rank=r_ + 1))
 
-        print("\n5. Generating SHAP importance ranking...")
-        shap_ranking = get_shap_ranking(shap_vals, X_test)
-        print("\n[SHAP importance ranking (high to low)]")
-        print(shap_ranking.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+        idx = np.random.RandomState(RNG).choice(len(Xf), size=min(N_SHAP, len(Xf)), replace=False)
+        sv = np.array(shap.TreeExplainer(rf).shap_values(Xf[idx]))
+        for j in top4:
+            for k in range(len(idx)):
+                rows.append((OUTCOME_EN[oc], FEATURES[j], float(Xf[idx][k, j]), float(sv[k, j])))
 
-        if save_plot:
-            os.makedirs(os.path.dirname(save_plot), exist_ok=True)
-        plot_shap_ranking(shap_ranking, save_path=save_plot)
+        print(f"[{OUTCOME_EN[oc]}] top4 = {[FEATURES[j] for j in top4]}  "
+              f"({time.time() - t0:.0f}s)", flush=True)
 
-        # Auto-export the CSV ranking table
-        csv_path = os.path.splitext(save_plot)[0] + "_shap_ranking_table.csv"
-        shap_ranking.to_csv(csv_path, index=False, encoding="utf-8-sig")
-        print(f"Ranking table saved to: {csv_path}")
-
-    except Exception as e:
-        print(f"\nError: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    pd.DataFrame(rows, columns=["outcome", "feature", "value", "shap"]).to_csv(
+        OUT_LONG, index=False, encoding="utf-8-sig")
+    pd.DataFrame(rank).to_csv(OUT_RANK, index=False, encoding="utf-8-sig")
+    print("done", flush=True)
 
 
-# ==================== Main entry point ====================
 if __name__ == "__main__":
-    DATA_PATH = "C:/Users/DELL/Desktop/杭州中心城区/杭州中心城区数据提取.csv"
-    SAVE_PLOT_PATH = "C:/Users/DELL/Desktop/数据/SHAP图/1003/SHAP排名图.png"
-
-    main(
-        data_path=DATA_PATH,
-        target_var="血糖偏离度  ",
-        save_plot=SAVE_PLOT_PATH
-    )
+    main()

@@ -1,397 +1,436 @@
-import pandas as pd
-import geopandas as gpd
+# -*- coding: utf-8 -*-
+"""
+Geographically weighted regression (GWR) for the greenness - cardiometabolic analysis.
+
+Each greenness factor is modelled separately (univariate local regression) at the
+individual level. Outcomes and greenness factors are both residualised on the full
+confounder set and z-scored, so the local coefficient is a partial association.
+
+Confounder set matches the main manuscript:
+  - individual confounders: age (cubic polynomial) + gender + BMI + smoking +
+    drinking + physical activity + meal regularity
+  - environmental covariates: PM2.5, population density, elevation,
+    nighttime light, distance to major roads
+
+Bandwidth: adaptive Gaussian kernel, bandwidth = distance to the k-th nearest
+neighbour. k is selected by AICc over candidate fractions of n.
+Neighbour searches use cKDTree (no O(n^2) distance matrix).
+
+Inputs (paths are configurable; cohort data are not distributed):
+  FACTOR_CSV  per-individual factor table with outcomes, confounders, coordinates
+  STUDY_AREA  GeoJSON polygon used to clip the Voronoi map
+
+Output: gwr_results.pkl, gwr_diagnostics.csv, gwr_factor_correlation.csv
+"""
+import csv
+import json
+import math
 import os
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.spatial import Voronoi
-from shapely.geometry import Polygon, Point, MultiPolygon
-from shapely.ops import unary_union
-import mapclassify as mc
-from mgwr.sel_bw import Sel_BW
-from mgwr.gwr import GWR
+import pickle
 import warnings
+
+import numpy as np
+from scipy.spatial import cKDTree
+from shapely.geometry import shape, Polygon, MultiPolygon
+from shapely.ops import unary_union
+
 warnings.filterwarnings("ignore")
+np.seterr(all="ignore")
 
-# ====================== Core parameter configuration (everything you need to edit is here) ======================
-# 1. Basic configuration (target variable first for easy editing)
-TARGET_VARIABLE = "平均动脉压偏离度"  # Target variable (placed first, can be edited directly)
-TARGET_FACTOR = "绿度季节变化"  # The target factor to process in this run (switch manually)
+# ------------------------------------------------------------------ configuration
+FACTOR_CSV = os.environ.get("FACTOR_CSV", "data/factor_table.csv")
+STUDY_AREA = os.environ.get("STUDY_AREA", "data/study_area.geojson")
+OUT_DIR = os.environ.get("GWR_OUT", "output/gwr")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# 2. Data path configuration
-csv_path = "C:/Users/DELL/Desktop/杭州中心城区/杭州中心城区数据提取.csv"
-geojson_path = "C:/Users/DELL/Desktop/杭州中心城区/中心城区带县.geojson"
-target_crs = "EPSG:32650"  # UTM 50N projection (consistent with the GeoJSON)
-output_root = "C:/Users/DELL/Desktop/杭州中心城区/GWR单因子输出"  # Output root directory
-
-# 3. Data-processing parameters (age removal + standardisation)
-POLY_DEGREE = 3  # Polynomial regression degree (fixed to 3)
-GREENNESS_FACTOR = "绿度季节变化"  # Greenness factor to be z-score standardised (only applied when the target factor is this one)
-
-# 4. Image output parameters (reversed colormap + no white margin + adjustable border)
-DPI = 600  # Image resolution (high DPI)
-FIG_SIZE = (15, 12)  # Image size (width x height)
-CMAP = plt.cm.coolwarm  # Reversed colormap (blue = low, red = high; originally coolwarm_r, now coolwarm)
-POLYGON_EDGE_WIDTH = 0.1  # Voronoi polygon edge width (default 0.1, adjust thinner/thicker freely)
-STUDY_AREA_BORDER_WIDTH = 0.8  # Study-area border width (default 0.8, adjust thinner/thicker freely)
-
-# 5. Fixed variable configuration (no need to edit)
-all_factors = ["平均绿度", "绿度聚集度", "绿度季节变化", "植被年龄", "绿度范围"]  # List of all factors
-# ==================================================================================
-
-# Validate parameters
-if TARGET_FACTOR not in all_factors:
-    raise ValueError(f"Target factor '{TARGET_FACTOR}' is not in the factor list! Available factors: {all_factors}")
-if TARGET_VARIABLE not in pd.read_csv(csv_path).columns:
-    warnings.warn(f"Target variable '{TARGET_VARIABLE}' was not found in the CSV; modelling may fail, please check the column names!")
-
-# Create output directory (named after target variable + target factor)
-output_img_dir = os.path.join(output_root, f"{TARGET_VARIABLE}_{TARGET_FACTOR}")
-os.makedirs(output_img_dir, exist_ok=True)
-print(f"Current run configuration:")
-print(f"- Target variable: {TARGET_VARIABLE} (placed first, can be edited directly)")
-print(f"- Factor processed this run: {TARGET_FACTOR}")
-print(f"- Polynomial regression degree: {POLY_DEGREE} (only the target factor is processed)")
-print(f"- Standardised greenness factor: {GREENNESS_FACTOR} (applied only when the target factor is this one)")
-print(f"- Image config: reversed colormap (blue = low, red = high), no white margin, no colorbar, no text")
-print(f"- Voronoi polygon edge width: {POLYGON_EDGE_WIDTH}")
-print(f"- Study-area border width: {STUDY_AREA_BORDER_WIDTH}")
-print(f"- Image DPI: {DPI}")
-print(f"- Output directory: {output_img_dir}")
-
-# ---------------------- Data reading and preprocessing ----------------------
-# 1. Read data + study-area boundary
-df_points = pd.read_csv(csv_path, encoding="utf-8")
-gdf_study_area = gpd.read_file(geojson_path).to_crs(target_crs)
-study_area = unary_union(gdf_study_area.geometry)
-print(f"\nNumber of GeoJSON partitions in study area: {len(gdf_study_area)}")
-print(f"Number of CSV point records: {len(df_points)}")
-
-# 2. Point-data preprocessing (keep valid points inside the study area)
-gdf_points = gpd.GeoDataFrame(
-    df_points,
-    geometry=gpd.points_from_xy(df_points["经度"], df_points["纬度"]),
-    crs="EPSG:4326"
-).to_crs(target_crs)
-
-# Keep only points inside the study area
-gdf_points = gdf_points[gdf_points.within(study_area)].copy()
-print(f"Number of valid points inside study area: {len(gdf_points)}")
-
-# 3. Data completeness check (must include age column, target variable, all factors)
-required_cols = [TARGET_VARIABLE] + all_factors + ["年龄"]
-missing_cols = [col for col in required_cols if col not in gdf_points.columns]
-if missing_cols:
-    raise ValueError(f"Data is missing variables: {missing_cols}\nPlease check that the CSV column names match!")
-
-# 4. Handle missing values and outliers
-y_std = gdf_points[TARGET_VARIABLE].std()
-y_mean = gdf_points[TARGET_VARIABLE].mean()
-gdf_points = gdf_points[
-    (gdf_points[TARGET_VARIABLE] >= y_mean - 3*y_std) &
-    (gdf_points[TARGET_VARIABLE] <= y_mean + 3*y_std)
+# outcomes: (key, column, type); binary outcomes use clinical thresholds
+OUTCOMES = [
+    ("SBP", "sbp", "continuous"),
+    ("DBP", "dbp", "continuous"),
+    ("MAP", None, "continuous"),
+    ("FPG", "fpg", "continuous"),
+    ("HTN", None, "binary"),
+    ("HBG", None, "binary"),
 ]
-n = len(gdf_points)
-print(f"Number of valid points after outlier removal: {n}")
 
-# 5. Core step 1: 3rd-order polynomial regression to remove age effect for the target factor only
-print(f"\nRemoving age effect from target factor '{TARGET_FACTOR}' via {POLY_DEGREE}-order polynomial regression...")
-age_vals = gdf_points["年龄"].values
+# five greenness factors
+FACTORS = [
+    "绿度暴露_r500",
+    "绿度强度_r500",
+    "绿度聚集度_GAI",
+    "季节振幅_谐波_r500",
+    "绿度年龄_r500",
+]
+FACTOR_EN = {
+    "绿度暴露_r500": "Greenness exposure",
+    "绿度强度_r500": "Greenness intensity",
+    "绿度聚集度_GAI": "Aggregation index",
+    "季节振幅_谐波_r500": "Seasonal amplitude",
+    "绿度年龄_r500": "Greenness age",
+}
+OUTCOME_EN = {
+    "SBP": "Systolic BP", "DBP": "Diastolic BP", "MAP": "Mean arterial P",
+    "FPG": "Fasting glucose", "HTN": "Hypertension", "HBG": "Hyperglycaemia",
+}
 
-# Store all processed factors (target factor processed, others kept as raw)
-processed_factor_cols = []
-target_raw_range = None  # Original value range of the target factor
-target_processed_range = None  # Range of the target factor after age removal
-target_normalized_range = None  # Range of the target factor after standardisation (if any)
+# individual confounders (age handled separately as a cubic polynomial)
+INDIV_COV = ["gender", "bmi", "smoking", "drinking", "pa", "meal_reg"]
+AGE_COL = "age"
+AGE_DEG = 3
 
-for factor in all_factors:
-    if factor == TARGET_FACTOR:
-        # Record original value range
-        raw_vals = gdf_points[factor].values
-        target_raw_range = (np.min(raw_vals), np.max(raw_vals))
-        # Remove age effect with 3rd-order polynomial
-        coeffs = np.polyfit(age_vals, raw_vals, deg=POLY_DEGREE)
-        predicted_vals = np.polyval(coeffs, age_vals)
-        residual_vals = raw_vals - predicted_vals  # Factor values after age removal
-        # Record range after age removal
-        target_processed_range = (np.min(residual_vals), np.max(residual_vals))
-        processed_col = f"{factor}_processed"
-        gdf_points[processed_col] = residual_vals
-        processed_factor_cols.append(processed_col)
-        print(f"- {factor} original value range: [{target_raw_range[0]:.4f}, {target_raw_range[1]:.4f}]")
-        print(f"- {factor} range after age removal: [{target_processed_range[0]:.4f}, {target_processed_range[1]:.4f}]")
-        print(f"- {factor}: age removal done (residual mean: {residual_vals.mean():.4f}, std: {residual_vals.std():.4f})")
-    else:
-        # Non-target factors: keep original values
-        processed_col = f"{factor}_processed"
-        gdf_points[processed_col] = gdf_points[factor].values
-        processed_factor_cols.append(processed_col)
-        print(f"- {factor}: kept as original (age effect not removed)")
+# environmental covariates
+ENV_COV = ["PM2.5_r500", "人口密度_r500", "DEM_r500", "夜光_r500", "道路距离_主干道_r500"]
 
-# 6. Core step 2: z-score standardisation only when the target factor is a greenness factor
-target_processed_col = f"{TARGET_FACTOR}_processed"
-if TARGET_FACTOR == GREENNESS_FACTOR:
-    print(f"\nTarget factor is a greenness factor; performing z-score standardisation...")
-    greenness_vals = gdf_points[target_processed_col].values
-    mean_g = np.mean(greenness_vals)
-    std_g = np.std(greenness_vals)
+BW_FRACTIONS = (0.05, 0.08, 0.12, 0.17, 0.23, 0.30, 0.40, 0.50, 0.62)
 
-    if std_g < 1e-6:
-        greenness_z = np.zeros_like(greenness_vals)
-        print(f"Warning: standard deviation of {GREENNESS_FACTOR} after age removal is near 0; all values set to 0 after standardisation")
-    else:
-        greenness_z = (greenness_vals - mean_g) / std_g  # z-score formula
+# local equirectangular projection around Hangzhou (metres)
+LON0, LAT0 = 120.15, 30.27
+KX = 111320.0 * math.cos(math.radians(LAT0))
+KY = 110540.0
 
-    # Record range after standardisation
-    target_normalized_range = (np.min(greenness_z), np.max(greenness_z))
-    print(f"- {GREENNESS_FACTOR} range after standardisation: [{target_normalized_range[0]:.4f}, {target_normalized_range[1]:.4f}]")
-    # Update standardised values
-    gdf_points[target_processed_col] = greenness_z
-    print(f"- {GREENNESS_FACTOR}: standardisation done (mean: {greenness_z.mean():.4f}, std: {greenness_z.std():.4f})")
-else:
-    print(f"\nTarget factor is not a greenness factor; no standardisation performed")
 
-# 7. Prepare GWR modelling data (using all processed factors)
-X = np.array(gdf_points[processed_factor_cols]).astype(np.float64)
-y = np.array(gdf_points[TARGET_VARIABLE]).reshape((-1, 1)).astype(np.float64)
-coords = list(zip(gdf_points.geometry.x, gdf_points.geometry.y))
-print(f"\nNumber of coordinates used for GWR modelling: {len(coords)}")
+def ll_to_xy(lon, lat):
+    """Project lon/lat to local metres."""
+    return (lon - LON0) * KX, (lat - LAT0) * KY
 
-# ---------------------- GWR model construction ----------------------
-# 1. Automatically select the optimal bandwidth
-sel_bw = Sel_BW(coords, y, X)
-optimal_bw = sel_bw.search()
-print(f"\nGWR optimal bandwidth: {optimal_bw:.2f} m")
 
-# 2. Fit the GWR model
-gwr_model = GWR(coords, y, X, optimal_bw)
-gwr_results = gwr_model.fit()
-
-# 3. Save the local coefficients of each factor (by index)
-target_coeffs = None  # GWR coefficients of the target factor
-for idx, factor in enumerate(all_factors):
-    coeffs = gwr_results.params[:, idx]
-    gdf_points[f"{factor}_coefficient"] = coeffs
-    if factor == TARGET_FACTOR:
-        target_coeffs = coeffs  # Record the GWR coefficients of the target factor
-print(f"GWR model fitted; all factor coefficients saved")
-
-# Compute the final range of the target factor's GWR coefficients (after age regression + standardisation if any)
-final_gwr_coeff_range = (np.min(target_coeffs), np.max(target_coeffs)) if target_coeffs is not None else (0, 0)
-
-# ---------------------- Voronoi polygon generation and gap filling ----------------------
-# 1. Generate Voronoi polygons
-vor = Voronoi(coords)
-
-# 2. Convert Voronoi polygons to a GeoDataFrame
-def voronoi_to_gdf(vor, crs):
-    polygons = []
-    for region in vor.regions:
-        if not region or -1 in region:
-            continue
+# ------------------------------------------------------------------ data loading
+def to_float(v):
+    """Robust float conversion; returns nan for missing or invalid entries."""
+    if v is None:
+        return np.nan
+    s = str(v).strip().replace(",", "")
+    if s == "" or s.lower() in ("nan", "none", "na", "null"):
+        return np.nan
+    if s.endswith("%"):
         try:
-            vertices = vor.vertices[region]
-        except Exception:
+            return float(s[:-1]) / 100.0
+        except ValueError:
+            return np.nan
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def load():
+    """Load the factor table, apply the analysis QC, and build the arrays."""
+    with open(FACTOR_CSV, encoding="utf-8-sig", errors="ignore") as f:
+        rows = list(csv.DictReader(f))
+
+    needed = ["经度", "纬度", AGE_COL] + INDIV_COV + ENV_COV + FACTORS + ["sbp", "dbp", "fpg"]
+    good, dropped = [], 0
+    for r in rows:
+        ok = all((c in r) and np.isfinite(to_float(r[c])) for c in needed)
+        if ok:
+            good.append(r)
+        else:
+            dropped += 1
+    rows = good
+    n = len(rows)
+    print(f"loaded {len(rows) + dropped} rows; dropped {dropped}; using n = {n}")
+
+    def col(c):
+        return np.array([to_float(r[c]) for r in rows], dtype=float)
+
+    # continuous outcomes: winsorise at the 1st/99th percentile (main-analysis QC)
+    sbp, dbp, fpg = col("sbp"), col("dbp"), col("fpg")
+    for arr in (sbp, dbp, fpg):
+        lo, hi = np.nanpercentile(arr, 1), np.nanpercentile(arr, 99)
+        np.clip(arr, lo, hi, out=arr)
+    mapv = (sbp + 2.0 * dbp) / 3.0
+
+    # binary outcomes from clinical thresholds on the winsorised values
+    htn = ((sbp >= 140) | (dbp >= 90)).astype(float)
+    hbg = (fpg >= 7.0).astype(float)
+
+    outcomes = {"SBP": sbp, "DBP": dbp, "MAP": mapv, "FPG": fpg, "HTN": htn, "HBG": hbg}
+
+    lon, lat = col("经度"), col("纬度")
+    x, y = ll_to_xy(lon, lat)
+    coords = np.column_stack([x, y]).astype(np.float64)
+
+    age = col(AGE_COL)
+    indiv = {c: col(c) for c in INDIV_COV}
+    env = {c: col(c) for c in ENV_COV}
+    green = {f: col(f) for f in FACTORS}
+    return rows, age, indiv, env, green, outcomes, coords, n
+
+
+# ------------------------------------------------------------------ adjustment
+def design_matrix(age, indiv, env):
+    """Full confounder design matrix: cubic age + individual + environmental."""
+    blocks = [np.vander(age, AGE_DEG + 1)]
+    blocks += [np.asarray(indiv[c], dtype=float).reshape(-1, 1) for c in INDIV_COV]
+    blocks += [np.asarray(env[c], dtype=float).reshape(-1, 1) for c in ENV_COV]
+    return np.column_stack(blocks)
+
+
+def residualize_ols(y, A):
+    """Residual of y on the confounder design matrix A."""
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return y - A @ beta
+
+
+def residualize_logit(y, A, max_iter=25):
+    """IRLS logistic residual for a binary outcome (deviance residual)."""
+    ncol = A.shape[1]
+    beta = np.zeros(ncol)
+    eta = A @ beta
+    for _ in range(max_iter):
+        p = 1.0 / (1.0 + np.exp(-eta))
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        W = p * (1 - p)
+        z = eta + (y - p) / W
+        XtWX = A.T @ (A * W[:, None])
+        XtWz = A.T @ (W * z)
+        beta = np.linalg.solve(XtWX + np.eye(ncol) * 1e-8, XtWz)
+        eta = A @ beta
+    p_hat = 1.0 / (1.0 + np.exp(-eta))
+    return y - p_hat
+
+
+def zscore(v):
+    s, m = float(np.nanstd(v)), float(np.nanmean(v))
+    return (v - m) / s if s > 1e-9 else np.zeros_like(v)
+
+
+# ------------------------------------------------------------------ GWR core
+def solve_k(idx_k, dist_k, ydev, X1, k, chunk=600):
+    """Local weighted least squares at bandwidth k (Gaussian kernel)."""
+    n = len(ydev)
+    b0 = np.zeros(n); b1 = np.zeros(n)
+    lev = np.zeros(n); resid = np.zeros(n); se = np.zeros(n)
+
+    bw = dist_k[:, k].copy()
+    if np.any(bw <= 0):
+        med = np.median(bw[bw > 0]) if np.any(bw > 0) else 1.0
+        bw[bw <= 0] = med
+
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        ii = idx_k[s:e, :k]
+        dd = dist_k[s:e, :k]
+        bwi = bw[s:e][:, None]
+        w = np.exp(-0.5 * (dd / bwi) ** 2)
+
+        x = X1[ii]
+        yv = ydev[ii]
+        sw = w.sum(1); swx = (w * x).sum(1); swxx = (w * x * x).sum(1)
+        swy = (w * yv).sum(1); swxy = (w * x * yv).sum(1)
+
+        det = sw * swxx - swx * swx
+        det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+        b0c = (swxx * swy - swx * swxy) / det
+        b1c = (sw * swxy - swx * swy) / det
+
+        xs = X1[s:e]
+        hat = (swxx - 2.0 * swx * xs + sw * xs * xs) / det
+        lev[s:e] = np.clip(hat, 0, 1)
+
+        resN = yv - (b0c[:, None] + b1c[:, None] * x)
+        sig2 = (w * resN ** 2).sum(1) / max(k - 2, 1)
+        var_b1 = sig2 * sw / det
+
+        b0[s:e] = b0c
+        b1[s:e] = b1c
+        se[s:e] = np.sqrt(np.clip(var_b1, 0, None))
+        resid[s:e] = ydev[s:e] - (b0c + b1c * xs)
+    return b0, b1, lev, resid, se
+
+
+def gwr_univariate(tree, ydev, X1, k_candidates):
+    """Fit univariate GWR over candidate bandwidths; return AICc-optimal fit."""
+    n = len(ydev)
+    Kq = min(max(k_candidates) + 1, n)
+    dist_k, idx_k = tree.query(tree.data, k=Kq)
+
+    best, curve = None, []
+    for k in k_candidates:
+        if k >= Kq:
+            k = Kq - 1
+        b0, b1, lev, resid, se = solve_k(idx_k, dist_k, ydev, X1, k)
+        rss = float(np.sum(resid ** 2))
+        trH = float(np.sum(lev))
+        sigma2 = rss / n
+        aicc = n * math.log(sigma2) + n * math.log(2 * math.pi) + n * (n + trH) / (n - 2 - trH)
+        curve.append((k, aicc))
+        if best is None or aicc < best[0]:
+            best = (aicc, k, b0, b1, lev, resid, se)
+    return best, curve
+
+
+def moran_i(resid, coords, knn=25):
+    """Residual Moran's I under a row-normalised k-nearest-neighbour weights matrix."""
+    n = len(resid)
+    tree = cKDTree(coords)
+    _, idx = tree.query(coords, k=knn + 1)
+    w = np.zeros((n, knn + 1))
+    w[:, 1:] = 1.0 / knn
+    z = resid - resid.mean()
+    Wz = (w * z[idx]).sum(1)
+    return float((z * Wz).sum() / (z * z).sum())
+
+
+def ols_fit(ydev, X1):
+    """Global OLS reference fit; returns coefficients and residual variance."""
+    A = np.column_stack([np.ones_like(X1), X1])
+    beta, *_ = np.linalg.lstsq(A, ydev, rcond=None)
+    resid = ydev - A @ beta
+    return beta, resid
+
+
+# ------------------------------------------------------------------ mapping
+def build_voronoi(coords, study_area):
+    """Voronoi polygons around the sample points, clipped to the study area."""
+    from scipy.spatial import Voronoi
+    from shapely.geometry import Point
+
+    vor = Voronoi(coords)
+    polys, pid = [], []
+    for i in range(len(coords)):
+        rverts = vor.regions[vor.point_region[i]]
+        if not rverts or -1 in rverts:
             continue
-        if len(vertices) < 3:
+        verts = vor.vertices[rverts]
+        if len(verts) < 3:
             continue
-        poly = Polygon(vertices)
-        if not poly.is_valid or poly.area == 0:
+        p = Polygon(verts)
+        if not p.is_valid or p.area == 0:
             continue
-        polygons.append(poly)
-    return gpd.GeoDataFrame(
-        {"voronoi_id": range(len(polygons)), "geometry": polygons},
-        crs=crs
-    )
+        inter = p.intersection(study_area)
+        if inter.is_empty:
+            continue
+        if inter.geom_type == "MultiPolygon":
+            for g in inter.geoms:
+                polys.append(g)
+                pid.append(i)
+        else:
+            polys.append(inter)
+            pid.append(i)
+    pid = np.array(pid, dtype=int)
 
-gdf_voronoi = voronoi_to_gdf(vor, target_crs)
-print(f"Number of initial Voronoi polygons: {len(gdf_voronoi)}")
+    # assign uncovered gaps to the nearest sample point
+    blanks = study_area.difference(unary_union(polys))
+    if not blanks.is_empty:
+        bpoly = blanks.geoms if blanks.geom_type == "MultiPolygon" else [blanks]
+        for b in bpoly:
+            c = b.centroid
+            d = np.sum((coords - np.array([c.x, c.y])) ** 2, axis=1)
+            polys.append(b)
+            pid = np.append(pid, int(np.argmin(d)))
+    return polys, pid
 
-# 3. Filter and clip to the study area
-gdf_voronoi_in_study = gdf_voronoi[gdf_voronoi.intersects(study_area)].copy()
-gdf_voronoi_in_study.geometry = gdf_voronoi_in_study.geometry.apply(lambda g: g.intersection(study_area))
-print(f"Number of Voronoi polygons inside study area (after clipping): {len(gdf_voronoi_in_study)}")
 
-# 4. Join the target factor's GWR coefficients
-coeff_col = f"{TARGET_FACTOR}_coefficient"  # Only the target factor's coefficient is of interest
-gdf_voronoi_join = gpd.sjoin(
-    gdf_voronoi_in_study,
-    gdf_points[["geometry", coeff_col]],
-    how="left",
-    predicate="contains"
-)
+def load_study_area():
+    """Load and project the study-area polygon."""
+    with open(STUDY_AREA, encoding="utf-8") as f:
+        gj = json.load(f)
+    feats = gj.get("features") or [gj]
+    polys_ll = []
+    for ft in feats:
+        geom = shape(ft.get("geometry") or ft)
+        if geom.geom_type == "Polygon":
+            polys_ll.append(geom)
+        elif geom.geom_type == "MultiPolygon":
+            polys_ll.extend(geom.geoms)
 
-# Filter valid polygons
-gdf_voronoi_valid = gdf_voronoi_join.dropna(subset=[coeff_col]).copy()
-gdf_voronoi_valid = gdf_voronoi_valid[["voronoi_id", "geometry", coeff_col]].reset_index(drop=True)
-print(f"Number of valid Voronoi polygons inside study area (with {TARGET_FACTOR} coefficient): {len(gdf_voronoi_valid)}")
+    def proj_poly(p):
+        ext = [ll_to_xy(x, y) for x, y in p.exterior.coords]
+        holes = [[ll_to_xy(x, y) for x, y in h.coords] for h in p.interiors]
+        return Polygon(ext, holes)
 
-# 5. Compute and fill the blank areas
-voronoi_union = unary_union(gdf_voronoi_valid.geometry) if len(gdf_voronoi_valid) > 0 else Polygon()
-blank_areas = study_area.difference(voronoi_union)
+    proj = [proj_poly(p) for p in polys_ll]
+    return MultiPolygon(proj) if len(proj) > 1 else proj[0]
 
-# Handle geometry type of blank areas
-def get_blank_list(blank_geom):
-    if blank_geom is None or getattr(blank_geom, "is_empty", False):
-        return []
-    return [blank_geom] if isinstance(blank_geom, Polygon) else list(blank_geom.geoms)
 
-blank_list = get_blank_list(blank_areas)
-print(f"Number of blank areas inside study area: {len(blank_list)}")
+def t_cdf(t, df):
+    """Student t CDF (SciPy if available, otherwise a normal approximation)."""
+    try:
+        from scipy import stats
+        return stats.t.cdf(np.clip(t, -1e6, 1e6), df)
+    except Exception:
+        from math import erf, sqrt
+        x = t / sqrt(1 + t * t / df)
+        return 0.5 * (1 + erf(x / sqrt(2)))
 
-# Fill blank areas with the nearest coefficient
-gdf_blank = gpd.GeoDataFrame(columns=["geometry", coeff_col], crs=target_crs)
-if len(blank_list) > 0:
-    gdf_blank = gpd.GeoDataFrame({"geometry": blank_list}, crs=target_crs)
-    gdf_blank["centroid"] = gdf_blank.geometry.centroid
-    gdf_blank_centroid = gpd.GeoDataFrame(
-        gdf_blank[["centroid"]].rename(columns={"centroid": "geometry"}),
-        crs=target_crs
-    )
-    # Nearest-neighbour matching
-    gdf_blank_join = gpd.sjoin_nearest(
-        gdf_blank_centroid,
-        gdf_voronoi_valid[["geometry", coeff_col]],
-        how="left",
-        distance_col="dist_to_voronoi"
-    )
-    gdf_blank[coeff_col] = gdf_blank_join[coeff_col].values
-    gdf_blank = gdf_blank[["geometry", coeff_col]].copy()
 
-# 6. Merge complete polygons (Voronoi + blank fill)
-gdf_voronoi_complete = pd.concat([
-    gdf_voronoi_valid[["geometry", coeff_col]],
-    gdf_blank
-], ignore_index=True)
-# Ensure valid geometry
-gdf_voronoi_complete["geometry"] = gdf_voronoi_complete.geometry.apply(
-    lambda g: g.intersection(study_area) if g is not None else g
-)
-gdf_voronoi_complete = gdf_voronoi_complete[~gdf_voronoi_complete.geometry.is_empty].reset_index(drop=True)
-print(f"Total number of polygons finally covering the study area: {len(gdf_voronoi_complete)}")
+# ------------------------------------------------------------------ main
+def main():
+    rows, age, indiv, env, green, outcomes, coords, n = load()
 
-# ---------------------- Visualisation (reversed colormap + no white margin + no colorbar + VSCode display) ----------------------
-print(f"\nGenerating high-DPI image for {TARGET_VARIABLE}_{TARGET_FACTOR} (blue = low, red = high, no white margin)...")
-# Create a standalone figure
-fig, ax = plt.subplots(1, 1, figsize=FIG_SIZE, dpi=DPI)
+    A = design_matrix(age, indiv, env)
+    print(f"confounder design matrix: {A.shape[1]} columns "
+          f"(cubic age + {len(INDIV_COV)} individual + {len(ENV_COV)} environmental)")
 
-# Compute coefficient range (for plotting)
-coeffs_valid = gdf_voronoi_complete[coeff_col].dropna().values
-local_vmin = np.min(coeffs_valid) if len(coeffs_valid) > 0 else 0
-local_vmax = np.max(coeffs_valid) if len(coeffs_valid) > 0 else 1
-print(f"{TARGET_FACTOR} coefficient range (for plotting): [{local_vmin:.4f}, {local_vmax:.4f}]")
+    # residualise outcomes on the full confounder set
+    ydev = {}
+    for key, _col, typ in OUTCOMES:
+        y = outcomes[key]
+        ydev[key] = residualize_ols(y, A) if typ == "continuous" else residualize_logit(y, A)
 
-# Plot polygons (reversed colormap + adjustable border)
-plot_gdf = gdf_voronoi_complete.copy()
-plot = plot_gdf.plot(
-    column=coeff_col,
-    ax=ax,
-    cmap=CMAP,  # Changed to coolwarm for blue-low / red-high
-    vmin=local_vmin,
-    vmax=local_vmax,
-    edgecolor="#E0E0E0",  # Border color (editable)
-    linewidth=POLYGON_EDGE_WIDTH,  # Adjustable border width
-    legend=False,  # No colorbar
-    alpha=0.95,
-    missing_kwds={
-        "color": "#F5F5F5",
-        "hatch": "///",
-        "label": ""  # No text label
-    }
-)
+    # residualise greenness factors symmetrically, then z-score
+    fdev = {f: zscore(residualize_ols(green[f], A)) for f in FACTORS}
 
-# Draw study-area border (adjustable border width)
-gpd.GeoDataFrame(geometry=[study_area], crs=target_crs).plot(
-    ax=ax,
-    facecolor="none",
-    edgecolor="black",  # Border color (editable)
-    linewidth=STUDY_AREA_BORDER_WIDTH,  # Adjustable border width
-    alpha=0.8
-)
+    study_area = load_study_area()
+    polys, pid = build_voronoi(coords, study_area)
+    print("voronoi polygons:", len(polys))
 
-# Remove all text and axes completely
-ax.set_xticks([])
-ax.set_yticks([])
-ax.set_xlabel("")
-ax.set_ylabel("")
-ax.grid(False)
+    tree = cKDTree(coords)
+    k_candidates = sorted({max(int(round(fr * n)), 10) for fr in BW_FRACTIONS})
 
-# Save image (no white margin: pad_inches=0, bbox_inches="tight")
-img_filename = f"{TARGET_VARIABLE}_{TARGET_FACTOR}_gwr_coefficient_map.png"
-img_path = os.path.join(output_img_dir, img_filename)
-plt.savefig(
-    img_path,
-    dpi=DPI,
-    bbox_inches="tight",  # Compact layout
-    pad_inches=0,  # Remove all white margins
-    facecolor="white",
-    edgecolor="none"
-)
-print(f"Image saved: {img_path}")
+    models, diag_rows = {}, []
+    for okey, _col, _typ in OUTCOMES:
+        yv = ydev[okey]
+        for f in FACTORS:
+            (aicc, kbest, b0, b1, lev, resid, se), curve = gwr_univariate(tree, yv, fdev[f], k_candidates)
+            tval = b1 / se
+            pval = 2 * (1 - t_cdf(np.abs(tval), n - 2))
+            moran = moran_i(resid, coords)
+            _beta_ols, resid_ols = ols_fit(yv, fdev[f])
+            med_se = float(np.nanmedian(se))
+            pct_sig = float(np.mean(pval < 0.05) * 100)
 
-# Display image in VSCode
-plt.show()
-plt.close(fig)  # Close figure after display to free memory
+            models[(okey, f)] = dict(
+                beta1=b1, se=se, p=pval, resid=resid, k=kbest, aicc=aicc,
+                moran=moran, med_se=med_se, pct_sig=pct_sig,
+                mean_b1=float(np.mean(b1)), med_b1=float(np.median(b1)),
+                aicc_curve=[(int(k), float(a)) for k, a in curve],
+            )
+            diag_rows.append(dict(
+                outcome=okey, outcome_en=OUTCOME_EN[okey], factor=f, factor_en=FACTOR_EN[f],
+                bw_k=kbest, bw_pct=round(100 * kbest / n, 1), aicc_gwr=round(aicc, 1),
+                moran_I=round(moran, 4), median_se=round(med_se, 5),
+                pct_sig=round(pct_sig, 1), mean_coef=round(float(np.mean(b1)), 5),
+                median_coef=round(float(np.median(b1)), 5),
+            ))
+            print(f"{okey:4s} {f:16s} k={kbest:4d} ({100 * kbest / n:4.1f}%) "
+                  f"AICc={aicc:10.1f} Moran={moran:+.4f} medSE={med_se:.5f} "
+                  f"%sig={pct_sig:5.1f} meanBeta={np.mean(b1):+.4f}")
 
-# ---------------------- Result export (filenames include target variable) ----------------------
-# Export GeoJSON
-geojson_filename = f"{TARGET_VARIABLE}_{TARGET_FACTOR}_gwr_result.geojson"
-out_geojson = os.path.join(output_img_dir, geojson_filename)
-gdf_voronoi_complete.to_file(out_geojson, driver="GeoJSON", encoding="utf-8")
+    # multicollinearity among the greenness factors
+    green_corr = np.corrcoef([green[f] for f in FACTORS])
+    print("\ngreenness pairwise correlation:\n", np.round(green_corr, 3))
 
-# Export report
-report_filename = f"{TARGET_VARIABLE}_{TARGET_FACTOR}_gwr_report.txt"
-out_report = os.path.join(output_img_dir, report_filename)
-with open(out_report, "w", encoding="utf-8") as f:
-    f.write(f"=== {TARGET_VARIABLE}_{TARGET_FACTOR} GWR Model Report ===\n")
-    f.write(f"Core configuration:\n")
-    f.write(f"  - Target variable: {TARGET_VARIABLE}\n")
-    f.write(f"  - Target factor: {TARGET_FACTOR}\n")
-    f.write(f"  - Polynomial regression degree: {POLY_DEGREE} (target factor only)\n")
-    f.write(f"  - Standardised greenness factor: {GREENNESS_FACTOR} (applied only when the target factor is this one)\n")
-    f.write(f"  - Image configuration:\n")
-    f.write(f"    - Colormap: {CMAP.name} (blue = low, red = high)\n")
-    f.write(f"    - Image features: no white margin, no colorbar, no text, high DPI\n")
-    f.write(f"    - Voronoi polygon edge width: {POLYGON_EDGE_WIDTH}\n")
-    f.write(f"    - Study-area border width: {STUDY_AREA_BORDER_WIDTH}\n")
-    f.write(f"    - Image DPI: {DPI}\n")
-    f.write(f"    - Image size: {FIG_SIZE}\n")
-    f.write(f"\nData-processing notes:\n")
-    f.write(f"  - Only '{TARGET_FACTOR}' had its age effect removed\n")
-    f.write(f"  - Other factors use raw values (age effect not removed)\n")
-    f.write(f"  - {'Target factor was z-score standardised' if TARGET_FACTOR == GREENNESS_FACTOR else 'No standardisation performed'}\n")
-    f.write(f"\nData range statistics:\n")
-    f.write(f"  - {TARGET_FACTOR} original value range: [{target_raw_range[0]:.4f}, {target_raw_range[1]:.4f}]\n")
-    f.write(f"  - {TARGET_FACTOR} range after age removal: [{target_processed_range[0]:.4f}, {target_processed_range[1]:.4f}]\n")
-    if target_normalized_range is not None:
-        f.write(f"  - {TARGET_FACTOR} range after standardisation: [{target_normalized_range[0]:.4f}, {target_normalized_range[1]:.4f}]\n")
-    f.write(f"  - {TARGET_FACTOR} final GWR coefficient range: [{final_gwr_coeff_range[0]:.4f}, {final_gwr_coeff_range[1]:.4f}]\n")
-    f.write(f"\nData information:\n")
-    f.write(f"  - Study-area GeoJSON path: {geojson_path}\n")
-    f.write(f"  - Number of valid points: {n}\n")
-    f.write(f"  - Number of Voronoi polygons inside study area: {len(gdf_voronoi_in_study)}\n")
-    f.write(f"  - Number of blank areas: {len(blank_list)}\n")
-    f.write(f"  - Total polygons finally covering the area: {len(gdf_voronoi_complete)}\n")
-    f.write(f"  - GWR optimal bandwidth: {optimal_bw:.2f} m\n")
-    f.write(f"\nCoefficient statistics:\n")
-    f.write(f"  - Coefficient range: [{local_vmin:.4f}, {local_vmax:.4f}]\n")
-    f.write(f"  - Median: {np.percentile(coeffs_valid, 50):.4f}\n")
-    f.write(f"  - Interquartile range: [{np.percentile(coeffs_valid, 25):.4f}, {np.percentile(coeffs_valid, 75):.4f}]\n")
-    f.write(f"  - Number of no-data areas: {np.sum(np.isnan(gdf_voronoi_complete[coeff_col].values))}\n")
+    out = dict(points=coords, polys=polys, pid=pid, study_area=study_area, models=models,
+               green_corr=green_corr, factors=FACTORS, factor_en=FACTOR_EN,
+               outcome_en=OUTCOME_EN, n=n)
+    with open(os.path.join(OUT_DIR, "gwr_results.pkl"), "wb") as f:
+        pickle.dump(out, f)
 
-#print(f"\nExport of this run finished!")
-print(f"1. Image file: {img_path} (displayed in VSCode)")
-#print(f"2. Data file: {out_geojson}")
-#print(f"3. Report file: {out_report}")
-print(f"\n=====================================")
-print(f"[Key range statistics] (shown last in terminal)")
-print(f"Target factor: {TARGET_FACTOR}")
-print(f"Pipeline: raw values -> 3rd-order polynomial age correction -> {'z-score standardisation' if TARGET_FACTOR == GREENNESS_FACTOR else 'no standardisation'} -> GWR modelling")
-print(f"1. Original value range: [{target_raw_range[0]:.4f}, {target_raw_range[1]:.4f}]")
-print(f"2. Range after age removal: [{target_processed_range[0]:.4f}, {target_processed_range[1]:.4f}]")
-if target_normalized_range is not None:
-    print(f"3. Range after standardisation: [{target_normalized_range[0]:.4f}, {target_normalized_range[1]:.4f}]")
-print(f"4. Final GWR coefficient range: [{final_gwr_coeff_range[0]:.4f}, {final_gwr_coeff_range[1]:.4f}]")
-print(f"=====================================")
-#print(f"\nTo change the target variable: edit 'TARGET_VARIABLE' in the core parameter section")
-#print(f"To switch the target factor: edit 'TARGET_FACTOR' in the core parameter section (options: {all_factors})")
-#print(f"To adjust border/boundary: edit 'POLYGON_EDGE_WIDTH' and 'STUDY_AREA_BORDER_WIDTH'")
+    with open(os.path.join(OUT_DIR, "gwr_diagnostics.csv"), "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(diag_rows[0].keys()))
+        w.writeheader()
+        w.writerows(diag_rows)
+
+    with open(os.path.join(OUT_DIR, "gwr_factor_correlation.csv"), "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow([""] + FACTORS)
+        for i, fr in enumerate(FACTORS):
+            w.writerow([fr] + [round(float(green_corr[i, j]), 3) for j in range(len(FACTORS))])
+
+    print("\nsaved ->", os.path.join(OUT_DIR, "gwr_results.pkl"))
+
+
+if __name__ == "__main__":
+    main()
